@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+import sys
+import os
+import time
+import json
+import subprocess
+import signal
+import re
+
+TABLE_BASE = 100
+current_proc = None
+active_rules = {}  # ifname -> (ip, table_id)
+
+def log(msg):
+    print(f"[fdm-balancer] {msg}", flush=True)
+
+def ensure_sysctl():
+    subprocess.run(["sysctl", "-w", "net.ipv4.conf.all.rp_filter=2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["sysctl", "-w", "net.ipv4.conf.default.rp_filter=2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def get_wan_interfaces():
+    try:
+        res = subprocess.run(["ip", "-j", "-4", "addr"], capture_output=True, text=True)
+        addrs = json.loads(res.stdout)
+        routes_res = subprocess.run(["ip", "-j", "route"], capture_output=True, text=True)
+        routes = json.loads(routes_res.stdout)
+    except Exception as e:
+        log(f"Error reading ip info: {e}")
+        return []
+
+    gateways = {}
+    for r in routes:
+        dev = r.get("dev")
+        gw = r.get("gateway")
+        if dev and gw and r.get("dst") == "default":
+            gateways[dev] = gw
+
+    wan_ifaces = []
+    for a in addrs:
+        ifname = a.get("ifname", "")
+        # Exclude loopback, virtual containers, tailscale, docker bridges
+        if ifname == "lo" or ifname.startswith(("br-", "docker", "veth", "tailscale", "dummy")):
+            continue
+        ip_info = a.get("addr_info", [])
+        for info in ip_info:
+            ip = info.get("local")
+            if ip:
+                gw = gateways.get(ifname)
+                if not gw:
+                    gw_check = subprocess.run(["ip", "route", "show", "dev", ifname], capture_output=True, text=True)
+                    m = re.search(r"via\s+(\d+\.\d+\.\d+\.\d+)", gw_check.stdout)
+                    if m:
+                        gw = m.group(1)
+                    else:
+                        m2 = re.search(r"(\d+\.\d+\.\d+\.)\d+/\d+", gw_check.stdout)
+                        if m2:
+                            gw = m2.group(1) + "1"
+                if gw:
+                    wan_ifaces.append({"ifname": ifname, "ip": ip, "gw": gw})
+    return wan_ifaces
+
+def sync_policy_routing(wan_ifaces):
+    global active_rules
+    current_ifnames = {item["ifname"] for item in wan_ifaces}
+
+    for ifname in list(active_rules.keys()):
+        if ifname not in current_ifnames:
+            old_ip, table_id = active_rules[ifname]
+            log(f"Removing routing table {table_id} for disconnected interface {ifname} ({old_ip})")
+            subprocess.run(["ip", "rule", "del", "from", old_ip, "lookup", str(table_id)], stderr=subprocess.DEVNULL)
+            subprocess.run(["ip", "route", "flush", "table", str(table_id)], stderr=subprocess.DEVNULL)
+            del active_rules[ifname]
+
+    for idx, item in enumerate(wan_ifaces):
+        ifname = item["ifname"]
+        ip = item["ip"]
+        gw = item["gw"]
+        table_id = TABLE_BASE + idx + 1
+
+        route_check = subprocess.run(["ip", "route", "show", "table", str(table_id)], capture_output=True, text=True)
+        route_exists = "default via" in route_check.stdout
+
+        if ifname in active_rules and active_rules[ifname] == (ip, table_id) and route_exists:
+            continue
+
+        subprocess.run(["ip", "rule", "del", "from", ip, "lookup", str(table_id)], stderr=subprocess.DEVNULL)
+        subprocess.run(["ip", "rule", "add", "from", ip, "lookup", str(table_id)], check=True)
+        subprocess.run(["ip", "route", "replace", "default", "via", gw, "dev", ifname, "table", str(table_id)], check=True)
+        active_rules[ifname] = (ip, table_id)
+        log(f"Configured policy routing for {ifname}: from {ip} via {gw} (table {table_id})")
+
+def cleanup(signum=None, frame=None):
+    global current_proc, active_rules
+    log("Shutting down fdm-balancer...")
+    if current_proc:
+        try:
+            current_proc.terminate()
+            current_proc.wait(timeout=2)
+        except Exception:
+            current_proc.kill()
+    for ifname, (ip, table_id) in active_rules.items():
+        subprocess.run(["ip", "rule", "del", "from", ip, "lookup", str(table_id)], stderr=subprocess.DEVNULL)
+        subprocess.run(["ip", "route", "flush", "table", str(table_id)], stderr=subprocess.DEVNULL)
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, cleanup)
+signal.signal(signal.SIGTERM, cleanup)
+
+def main():
+    global current_proc
+    ensure_sysctl()
+    last_signature = None
+
+    log("Service started. Monitoring network interfaces for FDM load balancing...")
+
+    while True:
+        try:
+            wan_ifaces = get_wan_interfaces()
+            wan_ifaces.sort(key=lambda x: x["ifname"])
+            signature = tuple((x["ifname"], x["ip"], x["gw"]) for x in wan_ifaces)
+
+            if signature != last_signature:
+                if not wan_ifaces:
+                    log("No active WAN interfaces detected. Waiting...")
+                else:
+                    log(f"Network change detected! Active interfaces: {[x['ifname'] for x in wan_ifaces]}")
+                    sync_policy_routing(wan_ifaces)
+
+                    if current_proc:
+                        log("Stopping previous dispatch instance...")
+                        try:
+                            current_proc.terminate()
+                            current_proc.wait(timeout=2)
+                        except Exception:
+                            current_proc.kill()
+
+                    dispatch_bin = subprocess.run(["which", "dispatch"], capture_output=True, text=True).stdout.strip() or "/usr/bin/dispatch"
+                    dispatch_args = [dispatch_bin, "start", "-H", "127.0.0.1", "-p", "1080"]
+                    for x in wan_ifaces:
+                        dispatch_args.append(f"{x['ip']}@1")
+
+                    cmd_str = " ".join(dispatch_args)
+                    log(f"Launching: {cmd_str}")
+                    current_proc = subprocess.Popen(dispatch_args)
+                    last_signature = signature
+            else:
+                if wan_ifaces:
+                    sync_policy_routing(wan_ifaces)
+
+            if current_proc and current_proc.poll() is not None:
+                log("dispatch-proxy exited unexpectedly. Restarting in 2s...")
+                last_signature = None
+
+        except Exception as e:
+            log(f"Error in main loop: {e}")
+
+        time.sleep(3)
+
+if __name__ == "__main__":
+    main()
